@@ -1,7 +1,8 @@
-Code Snippets used in the article, "Model-Based Uncertainty"
+Code used in the article, "Model-Based Uncertainty"
 
 NOTE: The MVAD data that we used for this paper is public. 
 
-UNDER CONSTRUCTION
+DecompVarR2.Rmd - reproduces all plots used in the paper
+dat31_3.Rdata - simulated data used in the paper
 
 Questions? Contact marc.scott@nyu.edu (corresponding author)
