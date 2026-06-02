@@ -1,0 +1,973 @@
+---
+title: "Knowing What We Don't Know: Model-Based Uncertainty Decomposition for Categorical Sequences"
+author: "Marc A. Scott/Fulvia Pennoni/Ignacio Borquez" 
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: false
+    number_sections: true
+    latex_engine: xelatex
+    keep_tex: true
+  word_document:
+    toc: true
+  html_document:
+    toc: true
+    df_print: paged
+bibliography: ref.bib
+header-includes:
+- \usepackage[fontsize=12pt]{scrextend}
+- \usepackage{makeidx}
+- \makeindex
+- \usepackage{amsmath, amssymb}
+- \usepackage{todonotes}
+- \usepackage{comment}
+- \usepackage{float}
+- \usepackage{soul}
+- \usepackage{caption}
+- \captionsetup{font=small}  
+- \bibliographystyle{apalike}
+- \def\b#1{\boldsymbol{#1}}
+---
+
+
+```{r setup, include=F, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+library(TraMineR)
+library(TraMineRextras)
+library(DataVisualizations)
+library(ggseqplot)
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(cfda)
+library(DescTools)
+library(LMest)
+library(reshape2)
+library(tidyverse)
+library(cluster)
+library(formula.tools)
+library(questionr)
+library(descriptio)
+
+silent <- TRUE #parameter to "try" command
+useEmpiric <- F # initial values calculated through lmest/Mc or using $V or initial state distn. (more important for HMMs)
+```
+
+```{r read_data, echo=FALSE, eval=TRUE, results='hide',warning=FALSE,message=F}
+load("dat31_3.Rdata") #reads in dat1; if dat30, reads in dat
+M <- 31
+nToks <- 3
+nTry <- 10 # lmestMc random starts
+randoLong <- dat31_3 %>% rename(state=y1)
+randoWide <- reshape(randoLong[,1:3], idvar="id", timevar="time", direction="wide", v.names="state")
+colnames(randoWide)[-1] <- as.character(1:M) #hardcoded for now.
+seq_rando <- suppressMessages(seqdef(randoWide,2:(M+1),states=1:nToks, labels=c("A","B","C")[1:nToks],start=1))
+```
+
+```{r sim-skew,include=T,echo=F,warning=FALSE}
+ent.obs <- seqient(seq_rando)
+#plot(density(ent.obs))
+ent.skew <- Skew(ent.obs,conf.level=0.95)
+ent.beta <- MASS::fitdistr(ent.obs, densfun="beta", start=list(shape1=1, shape2=1))
+```
+
+```{r seq_ex1_pt0,echo=FALSE, warning=F, message=F, results='hide', fig.dim=c(8,4), fig.cap="\\label{fig:seqplots-sim}Simulated Data: state distribution plot (left panel) and index plot (right panel). State distribution plots display the proportion of states at each time point, enabling us to observe the aggregate change in the distribution of states over time. The index plots order subjects by their first observed state and the length of that state and each individual is represented by a single line in the plot. In the left panel, cross-sectional entropy (dashed black line) is nearly constant."}
+gg1<-ggseqdplot(seq_rando,with.entropy=TRUE, weight=FALSE)+guides(color=guide_legend(nrow=1))+xlab("Occasion")+theme(axis.title.x=element_text(size=8),legend.text=element_text(size=7))
+gg2<-ggseqiplot(seq_rando,sortv=sortv(seq_rando,start="beg"))+theme(legend.position="none")+xlab("Occasion")+theme(axis.title.x=element_text(size=8))
+invisible_grob <- grid::rectGrob(name="invisible_grob",width=unit(0,"null"),height=unit(0, "null"))
+gridExtra::grid.arrange(gg1,arrangeGrob(invisible_grob,gg2,invisible_grob,
+                         heights=c(0.01,0.92,.07)),ncol=2)
+```
+
+```{r entropy_func, include=TRUE, echo=FALSE}
+seqHt <- function(data,group=NULL,weighted=FALSE) {
+#  Compute entropy
+  if (is.null(group)) {
+    wts <- rep(1,nrow(data)) #default
+    if (weighted) wts <- attr(data,"weights")
+    nStates <- length(attr(data,"alphabet"))
+    TT <- ncol(data)
+    Ht <- rep(NA,TT)
+    for (i in 1:TT) {
+      Ht[i] <- ent(prop.table(wtd.table(data[,i], weight=wts))[1:nStates])
+    }
+    return(Ht)
+  }
+  #easier to use built-in functions for grouped
+  splSeq <- split(data,group)
+  lapply(splSeq,function(x) seqstatd(x,weighted=weighted,norm=F)$Entropy)  
+}
+```
+
+
+```{r entropy-fns, echo=FALSE}
+#"helper" functions:
+
+ent <- function(p) { #use of log base e is to be consitent with TraMineR choices. 
+  -sum(p*ifelse(p==0,0,log(p))) #assumes p never 0
+}
+
+expit <- function(x) exp(x)/(1+exp(x))
+
+invMlogit <- function(beta,X) {
+    expXB <- exp(cbind(0,X%*%beta))
+    expXB/apply(expXB,1,sum)
+}
+
+adjustMat<-function(x) {
+  #assumes first row should be diag
+  n <- dim(x)[1]
+  newx <- x
+  for (i in 1:n) {
+    tmp <- x[1,i]
+    newx[-i,i] <-  x[-1,i]
+    newx[i,i] <- tmp
+  }
+  newx
+}
+
+condEntropy <- function(obsVect,mcEst,X.init=NULL,X.trans=NULL) {
+  #NOTE: when ~1 is the model, we rely on calling function to populate the X.init and X.trans with a column of 1s
+  #use result from lmestMc to est conditional (on last observed state) entropy over time
+  #assumes obs states are 1,2, etc, so that it's easy to index them with the results from the MC est
+  #mcEst: $piv: initial probs; $Pi an array of Markov transition matrices returned by lmestMc the last index in the array is the time point (occasion) 
+  #if !is.null(X) there are covariates, and mcEst$Ga and $Be will be logit model fits.
+  n <- length(obsVect)
+  r <- rep(NA,n)
+  if (is.null(X.init)&&is.null(X.trans)) {
+    prOut <- matrix(mcEst$piv,nrow=length(mcEst$piv),ncol=n) #starting point to assign probs[,1]
+    r[1] <- ent(mcEst$piv) #initial entropy of first observation
+    for (i in 2:n) {
+      r[i] <- ent(mcEst$Pi[obsVect[i-1],,i]) #entropy of each observation (starting at 2) conditional on the prior (lag-1) observation
+                                             #use obsVect[i-1] to pick the correct row of the Markov chain; compute its entropy
+      prOut[,i] <- mcEst$Pi[obsVect[i-1],,i]
+    } 
+  } else { #this needs work for multinomial (general) case. Not just mover stayer. 
+    #cases: dim(mcEst$Ga) is 2 dimensional or 3 dimensional.
+    #use invMlogit on mcEst$Ga[,,k] or [,k] depending on dimensionality.
+    if (!is.null(X.init)) {
+      X.initM <- as.matrix(X.init)
+    } else X.initM <- as.matrix(X.trans) #NULL means use the other model as base.
+    probInit <- as.vector(invMlogit(mcEst$Be,c(1,X.initM[1,]))) #reference will always be state "1";use of first record in data is mostly ignored, as lmestMc sets any coefficient other than constant to 0; as.vector as invMlogit is more general, returns a matrix
+    r[1] <- ent(probInit) #initial entropy of first observation
+    #rearrange $Ga to always be a 3-D array:
+    gammArray <- mcEst$Ga
+    dims <- dim(gammArray)
+    if (length(dims)==2) { #adjust
+      dims <- c(dims[1],1,dims[2])
+      gammArray <- array(gammArray,dims)
+    }
+    nStates <- dims[3]
+    probs <- array(NA,c(n,nStates,nStates))
+    X.transM <- as.matrix(X.trans) #NEVER NULL ???? FIX?
+    for (k in 1:nStates) {
+      tmp <- invMlogit(gammArray[,,k],cbind(1,X.transM)) #needs adjustment - move 1st element to diagonal
+      probs[,,k] <- tmp
+    }
+    prOut <- matrix(NA,nStates,n)
+    prOut[,1] <- probInit
+    for (i in 2:n) {
+      probs[i,,] <- t(adjustMat(probs[i,,])) # correct the reference group 
+      r[i] <- ent(probs[i,obsVect[i-1],]) #entropy of each observation (starting at 2) conditional on the X
+      prOut[,i]<-probs[i,obsVect[i-1],]
+                                         #use obsVect[i-1] to pick the correct row of the Markov chain 
+                                        # note that we now move the reference category even though the correct position as entropy is not affected by the ordering.
+      } 
+  }
+  list(obsEntVect=r,obsPiArr=prOut)
+}
+########
+
+##function to compute eqn (2) from a single lmestMc fit.
+
+avgEnt <- function(mcFit,weights=NULL) {
+    #use result of mcFit to compute entropy at the observation level, then combine
+    #using formula (2), which moves through the sequence and determines entropy conditional on covariates or lag-1 observation (depending on model fit)
+    idx <- eval(mcFit$call$index)
+    idVar <- idx[1]
+    timeVar <- idx[2]
+    datLong <- mcFit$data %>% arrange(idVar,timeVar)
+    #stateVar <- deparse(mcFit$call$responsesFormula[[2]])
+    if (!is.null(mcFit$call$responsesFormula)) {
+      stateVar <- deparse(mcFit$call$responsesFormula[[2]])
+    } else {
+      elim <- match(eval(mcFit$call$index),colnames(mcFit$data))
+      stateVar <- colnames(mcFit$data)[-elim][1] #in clase there are additional values, take first (kluge)
+    }
+    seqLen <- max(datLong[,timeVar]) #max time point. Assume time is in 1:seqLen
+    ids <- unique(datLong[,idVar]) #unique ids
+    if (is.null(weights)) weights <- rep(1,length(ids))
+    Ht <- rep(0,seqLen) #initialize assuming all 1:seqLen time points are observed in every seq
+    acc <- Ht #same data structure
+    for (i in seq_along(ids)) { #loop through each observation 
+      sel <- datLong[,idVar]==ids[i]
+      obs <- datLong[sel,stateVar]+1 #starting state 0 needs to be '1' for condEntropy call.
+      fmla <- mcFit$call$responsesFormula[[3]]
+      X.init <- X.trans <- NULL #default
+      if (!is.null(fmla)) {
+        if (fmla==as.formula(~1|NULL)[[2]] || fmla==as.formula(~NULL|1)[[2]]) fmla <- as.formula(~1) #equivalent for lmest, and simplifies remaining code
+        #FIX: X -> X.init, X.trans
+        if (as.character(fmla)[1]!="|") { #NEEDS to search for "|"
+          X.init <- X.trans <- datLong[sel,all.vars(fmla)]
+        } else {
+          lhs0 <- lhs(fmla)
+          if (!is.null(lhs0)) {
+            X.init <- matrix(1,sum(sel),1) #default for ~1 formula
+            if(lhs0!=1) X.init <- datLong[sel,all.vars(lhs0)] 
+          }
+          rhs0 <- rhs(fmla)
+          if (!is.null(rhs0)) {
+            X.trans <- matrix(1,sum(sel),1) #default for ~1 formula
+            if(rhs0!=1) X.trans <- datLong[sel,all.vars(rhs0)]
+          }
+        }
+      }
+      condEntRslt <- condEntropy(as.numeric(obs),mcFit,X.init,X.trans)
+      acc <- acc + weights[i]*condEntRslt$obsPiArr[cbind(obs,1:seqLen)]
+      Ht <- Ht + weights[i]*condEntRslt$obsEntVect
+    }
+    Ht <- Ht/sum(weights)
+    acc <- acc/sum(weights)
+    list(Ht=Ht,acc=acc)
+} 
+
+ent_of_avg <- function(mcFit) {
+    #use result of mcFit to compute population average one-step MC, then entropy of that (unweighted, since it's implicit in the previous average; sample weights are not used because they were already incorporated into the MC parameter estimates 
+    #added w-bar as an output 28Nov24
+    #using formula (1)
+    fmla <- mcFit$call$responsesFormula[[3]]
+    if (is.null(fmla)) { #simpler case
+      prob <- mcFit$piv #initial probs of each state
+      seqLen <- dim(mcFit$Pi)[3] #max time point. Assume time is in 1:seqLen
+    } else {
+      #now a bit different for model with covariates:
+      tMats <- apply(mcFit$PI,c(1,2,4),mean) #average transition matrix, but ignore time==1 
+      prob <- apply(mcFit$Pi,2,mean) #initial probs of each state
+      seqLen <- dim(mcFit$PI)[4] #max time point. Assume time is in 1:seqLen
+    }
+    wBar <- matrix(NA,length(prob),seqLen)
+    wBar[,1] <- prob
+    cumulEnt <- rep(NA,seqLen)
+    cumulEnt[1] <- ent(prob) #First time point entropy.
+    for (i in 2:seqLen) {
+      if (is.null(fmla)) { #simpler case
+        prob <- prob%*%mcFit$Pi[,,i] # step of the (average) one-step MC (standard move ahead one step)
+      } else {
+        prob <- prob%*%tMats[,,i] # (averaged) *conditional* 1-step transition matrices
+      }
+      cumulEnt[i] <- ent(prob) #take the entropy of the distribution at time i, and save it.
+      wBar[,i] <- prob #save w-bar as well
+    }
+    list(cumulEnt=cumulEnt,wBar=wBar)
+}
+
+invClogit <- function(yhat) {
+
+  #yhat should be length =(#outcomes-1) 
+  cprobs <- c(0,expit(rev(yhat)),1) #order change to this use of diff, etc.
+  rev(diff(cprobs))
+}
+
+
+
+ent_both.lmest <- function(lmestFit,weights=NULL,empiric=F) {
+    #use result of lmestFit to compute population average one-step MC, then entropy of that 
+    # NOTE: assume SINGLE OUTCOME (LHS of responses formula)
+    #using formulas (1) & (2)
+    if (is.null(lmestFit$V)) stop("Need to run with output=T\n")
+    V <- lmestFit$V #prob of each hidden state U at time t for each obs: nObs X nStates X TT
+    fmla <- lmestFit$call$responsesFormula ## assume for now that there is only one formula
+    TT <- lmestFit$TT #number of time points
+    nStates <- lmestFit$k #number of (hidden) states
+    idx <- eval(lmestFit$call$index)
+    idVar <- idx[1]
+    timeVar <- idx[2]
+    nObs <- length(unique(lmestFit$data[,idVar])) #in case of weights this is more reliable, as weights arbitrarily inflate lmestFit$n
+    datLong <- lmestFit$data %>% arrange(idVar,timeVar)
+    ids <- unique(datLong[,idVar]) #unique ids
+    if (is.null(weights)) weights <- rep(1,nObs)
+    Pi <- array(NA,c(nStates,nStates,TT)) # time dependent transitions between hidden states
+    outLevels <- dim(lmestFit$Psi)[1]
+    #Psi should be outLevels X nStates
+    if (is.null(outLevels)) outLevels <- dim(lmestFit$S)[1]
+    localPsi <- array(NA,c(outLevels,nStates,nObs,TT)) #need to assign local Psi.  Currently the transpose of Psi's dimensions
+    #
+    if (is.null(fmla) || is.null(try(rhs(fmla)))) { #simpler case. - but FIX (modBasic=0,1 cases)
+      piv <- lmestFit$piv #initial probs of each state (may need to be modified to accommodate 2 formulas - if there is one for initial states... ASK Fulvia)
+      piv.empiric <- piv #estimated and empiric are the same 
+      Pi <- lmestFit$Pi # one for each time point. nStates X nStates X TT
+      S <- 1 + lmestFit$S[,,1] #assumes one outcome (single channel)
+      if (length(dim(Pi))==2) Pi <- array(Pi,c(nStates,nStates,TT)) # repeat, for modBasic=1 case
+      Psi0 <- lmestFit$Psi[,,1] #conditional response probs. (assume one output)
+      Psi <- array(Psi0,c(dim(Psi0)[1:2],TT)) #repeat once for each time point.
+      for (i in 1:nObs) for (j in 1:TT) localPsi[,,i,j] <- Psi0 #don't transpose (v4.2)
+    } else { #build equivalent piv, Pi & Psi
+      piv <- lmestFit$la #initial probs of each state
+      #override $la, since it doesn't work well. Use $V to determine initial state (not sure if this is consistent with HMM framework, but $la seems wrong for measurement model)
+      piv.empiric <- apply(lmestFit$V[,,1],2,mean) ## for formula 3 only 
+      Pi <- array(lmestFit$PI,c(nStates,nStates,TT)) #repeat to have a consistent data structure
+      Psi <- array(0,c(outLevels,nStates,TT)) #setup. Needs to be filled. (NOTE!!! columns sum to one)
+      #use model with covariates:
+      al <- lmestFit$al #support points (specific to hidden state)
+      be <- lmestFit$be #betas (common)
+      mu <- lmestFit$mu #cut points (specific to outcome levels)
+      S <- apply(lmestFit$S==1,c(2,3),which)
+      # get X:
+      fmla <- lmestFit$call$responsesFormula
+      fmlaRHS <- rhs(fmla)
+      if (as.character(fmlaRHS)[1]=="|") { #case of a predictor for the initial probs
+        stop("LMMs do not have models for initial conditions\n") 
+      } else xNames <- all.vars(rhs(fmla))
+      if (is.null(xNames)) {
+        X <- matrix(1,nrow=nObs)
+      } else X <- cbind(1,datLong[,xNames])
+      alpha0 <- matrix(al,nrow=outLevels-1,ncol=nStates,byrow=T) + mu #latter adds in the cols
+      #for each obs:
+      #construct: mu + al + X*be, which should be (#outcomes-1) X (#hidden states)
+      #for each hidden state, pass log-odds to an invClogit function (for cumul. odds)
+      # results in one vector of (# outcomes) probs for each hidden state
+      #take wtd average by hidden states of that vector.
+      #populate the Psi array entries
+      for (i in 1:nObs) {
+        sel <- datLong[,idVar]==ids[i]
+        XB <- as.matrix(X[sel,])%*%be 
+        for (j in 1:TT) {
+          localPsi[,,i,j] <- apply(alpha0+XB[j,],2,invClogit) #transpose for later Mat product (cols sum to one w/o transpose)
+          Psi[,,j] <- Psi[,,j] + weights[i]*localPsi[,,i,j] #don't transpose (v4.1)
+        }        
+      }
+      Psi <- Psi/sum(weights)
+    }
+    cumulEnt <- rep(NA,TT)
+    condEnt <- rep(NA,TT)
+    probOut <- rep(NA,TT) #probability that we predict the right thing (within formula 4)
+    if (empiric) piv <- piv.empiric # time 1 distribution
+    prob <- piv
+    for (j in 1:TT) {
+      cumulEnt[j] <- ent(Psi[,,j]%*%matrix(prob,ncol=1))
+      condEnt[j] <- 0 #accumulator
+      probOut[j] <- 0 #accumulator
+      for (i in 1:nObs) {
+        if (j==1) {
+          pMat <- localPsi[,,i,j]%*%matrix(prob,ncol=1)
+        } else { #latent state distn X 1-step prob. 
+          pMat <- try(localPsi[,,i,j]%*%t(V[i,,j-1] %*% Pi[,,j])) #move one step (starting a step behind) & calc indiv output probs
+          if (class(pMat)[1]=="try-error") browser()
+        }
+        #browser()
+        condEnt[j] <- condEnt[j] + weights[i]*ent(pMat) # each obs entropy, wtd.avd
+        probOut[j] <- probOut[j] + weights[i]*pMat[S[i,j]] # FIX!!! is this the correct pMat for an accuracy assessment when using lmest manifest model. Seems wrong for covariate model, but maybe it's all due to poor starting states?
+      }
+      condEnt[j] <- condEnt[j]/sum(weights)
+      probOut[j] <- probOut[j]/sum(weights)
+      #prep for NEXT set of 
+      if (j<TT) {
+        prob <- prob%*%Pi[,,j+1] # move 1 hidden step 
+      }
+    }
+    list(formula3=cumulEnt,formula4=condEnt,condAcc=probOut,Pi=Pi,Psi=Psi,localPsi=localPsi,piv=piv,piv.empiric=piv.empiric) 
+}
+acc1 <- function(fit,seq) { 
+  #don't need weights b/c they are implicit in model fit & will be used by seqstatd if present.
+  seqd1 <-ent_of_avg(fit)$wBar
+  seqd2 <-seqstatd(seq)[[1]]
+  r <- 1-apply(abs(seqd1-seqd2),2,sum)/2
+  r
+}
+
+```
+
+
+
+
+```{r fit-plot-fns, echo=FALSE}
+movRef <- function(m,fill=0) {
+  #m is a rectangular array, JxK, that needs to be transposed to KxK with diag as ref, 
+  #default to fill
+  numCol <- ncol(m)
+  nms <- colnames(m)
+  r <- matrix(fill,numCol,numCol)
+  for (i in 1:numCol) {
+    r[i,-i] <- m[,i]
+  }
+  dimnames(r) <- list(nms,nms)
+  r
+}
+
+
+invMlogitLM <- function(Ga,X) {
+  #moves the reference category to reconstruct a transition matrix, given predictor effects and pred values
+  dims <- dim(Ga)
+  n <- dims[3]
+  m <- matrix(NA,n,n)
+  for (k in 1:n) {
+    row.prob <- invMlogit(Ga[,,k],X)
+    m[k,-k] <- row.prob[-1] # avoid ref category
+    m[k,k] <- row.prob[1] #assign to ref category
+  }
+  m
+}
+
+matPlotLM <- function(Ga,refVec=NULL,chgVec=NULL, ltys=c(1,2,4,1,2,4),lwds=c(1,1,1,2,2,2),cols=2:7,ylim=c(-0.25,+0.25),leg.pos1="bottom",leg.pos2="bottomright",cex.leg=0.7, plot=F, ...) {
+  #plots a transition matrix difference based on covariates
+  #typically pass main=....
+  nmsPred <- dimnames(Ga)[[1]]
+  nmsDest <- nmsOrig <- dimnames(Ga)[[3]]
+  nPreds <- length(nmsPred) # incl. intercept
+  xlen <- length(nmsOrig)
+  if (is.null(refVec)) { #def to c(1,0,...)
+    X0 <- rep(0,nPreds) #zeros
+    X0[1] <- 1 #intercept
+  } else X0 <- refVec
+  if (is.null(chgVec)) chgVec <- rep(1,nPreds-1) # default to 1
+  Mx <- array(NA,c(xlen,xlen,nPreds-1))
+  dimnames(Mx) <- list(nmsOrig,nmsDest,nmsPred[-1])
+  M0 <- invMlogitLM(Ga,X0) #diff (intercept/refVect only effects)
+  if (plot) {
+    matplot(1:xlen,matrix(0,xlen,2),axes=F,type='n',ylab=expression(paste(,Delta, " in trans. prob. over baseline")), xlab="Origin",ylim=ylim,...);axis(2);axis(1,at=1:xlen,cex.axis=0.75,labels=nmsOrig) #allows 'main' to be passed
+  }
+  for (i in 2:nPreds) {
+    X1 <- X0 
+    X1[i] <- X1[i] + chgVec[i-1] #covariate effect - NOW changed to allow for, e.g., 1sd change
+    Mx[,,i-1] <- invMlogitLM(Ga,X1) - M0 #changes in probs
+    if (plot) matlines(1:xlen,Mx[,,i-1],lty=ltys[i-1],lwd=lwds[i-1],col=cols[1:xlen])
+  }
+  if (plot) {
+    legend(leg.pos1,lty=ltys[1:(nPreds-1)],lwd=lwds[1:(nPreds-1)],legend=nmsPred[-1],cex=cex.leg,bty='n', title="Predictor")
+    legend(leg.pos2,lty=rep(1,xlen), col=cols[1:xlen],legend=nmsDest,cex=cex.leg,bty='n',title="Destination")
+  }
+  Mx
+}
+
+fitEnt <- function(responsesFormula, data, state.codes=NULL, subset.long=NULL, subset.wide=NULL, weight=NULL, seed.init=10101, nTry=15,wt.factor=100,se=T) {
+  #fit a range of models (modBasic=0/1; conditional transition) using lmestMc
+  # !!! wt.factor may be unnecessary, but in prior versions, it corrected 'integer weights only' - ask Fulvia
+  #state.codes can be shorter codes for the various states
+  #record structures:
+  nLong <- nrow(data)
+  nWide <- length(unique(data[,"id"])) # all data must have 'id' and 'time' as well as states that begin with 0 (for lmestMc to function)
+  #deal with NULL weight
+  if (is.null(weight)) weight <- rep(1/wt.factor,nWide)  #will multiply weights by 100, eventually.
+  if (is.null(subset.wide)) {
+    subset.wide <- 1:nWide
+    subset.long <- 1:nLong
+  }
+  #model fits modBasic=0/1
+  fitXXallMB0 <- lmestMc(responsesFormula=NULL, index=c("id","time"), output=T, data=data[subset.long,c("id","time","state")], modBasic=0, seed=seed.init, weights=weight[subset.wide]*wt.factor) 
+  fitXXallMB1 <- lmestMc(responsesFormula=NULL, index=c("id","time"), output=T, data=data[subset.long,c("id","time","state")], modBasic=1, seed=seed.init, weights=weight[subset.wide]*wt.factor) 
+  #with covariates (cumulative sums of each state)
+  for (m in 1:nTry) {
+    fitXXcovAll <- try(lmestMc(responsesFormula=responsesFormula, index=c("id","time"), output=T, data=data[subset.long,], start=1, seed=seed.init+m-1,weights=weight[subset.wide]*wt.factor, out_se=se),silent=silent) 
+    if (class(fitXXcovAll)!="try-error") break #success
+  }
+  if (m==nTry) stop("Unable to fit responseFormula model")
+  fitXXcovAll$call$responsesFormula <- responsesFormula #needed in subsequent calls
+  #housekeeping to yield simpler names
+  if (!is.null(state.codes)) { 
+    dimnames(fitXXcovAll$Be)$logit <- state.codes[-1]
+    dimnames(fitXXcovAll$Ga)[[2]] <- state.codes[-1]
+    dimnames(fitXXcovAll$Ga)[[3]] <- state.codes
+  }
+  
+  #formulas for entropy in the text:
+  HtXX.MB0<-avgEnt(fitXXallMB0,weights=weight[subset.wide])$Ht 
+  HtXX.MB1<- avgEnt(fitXXallMB1,weights=weight[subset.wide])$Ht
+  HtXXcov<-avgEnt(fitXXcovAll,weights=weight[subset.wide])$Ht 
+  cumulEntXX.MB0 <- ent_of_avg(fitXXallMB0)$cumulEnt
+  cumulEntXX.MB1 <- ent_of_avg(fitXXallMB1)$cumulEnt
+  cumulEntXXcov <- ent_of_avg(fitXXcovAll)$cumulEnt
+  
+  return(list(fitMB0=fitXXallMB0,fitMB1=fitXXallMB1,fitCov=fitXXcovAll,HtMB0=HtXX.MB0, HtMB1=HtXX.MB1, HtCov=HtXXcov,cHtMB0=cumulEntXX.MB0,cHtMB1=cumulEntXX.MB1,cHtCov=cumulEntXXcov))
+}
+
+
+plotEnt <- function(fitEntObj, main="Model-Based Entropy",ylim=NULL,xlab="Occasion",tick.interval=NULL, cex.main=0.7,seqData, leg.pos="topleft",refLine=NULL,refLab="Reference Global", plot.it=T, useGG=F,linesize=1.2,...) {
+  
+    #seqData object is 'wide' fmt (weights must be stored with a seqdata constructor)
+    # subset outside of this function
+    # determine nTimePts, nStates
+    nStates <-  length(alphabet(seqData))
+    nTimePts <- ncol(seqData)
+    
+    HtEmpiric <- seqHt(seqData,weighted=!is.null(attr(seqData,"weights")))
+    #show entropy as per formulas (1) & (2)
+    if (is.null(ylim)) ylim<-c(0,ent(rep(1/nStates,nStates)))
+    #build dataset for return value, whether used by GG or not
+    dat <- data.frame(Time=1:nTimePts,Model=1,Type=1,Entropy=fitEntObj$cHtMB1) %>%
+           add_row(Time=1:nTimePts,Model=2,Type=1,Entropy=fitEntObj$cHtMB0) %>%  
+           add_row(Time=1:nTimePts,Model=3,Type=1,Entropy=fitEntObj$cHtCov) %>%  
+           add_row(Time=1:nTimePts,Model=1,Type=2,Entropy=fitEntObj$HtMB1) %>%  
+           add_row(Time=1:nTimePts,Model=2,Type=2,Entropy=fitEntObj$HtMB0) %>%  
+           add_row(Time=1:nTimePts,Model=3,Type=2,Entropy=fitEntObj$HtCov) %>%  
+           add_row(Time=1:nTimePts,Model=0,Type=1,Entropy=HtEmpiric)
+    dat <- dat %>% mutate(Model=factor(Model,levels=0:3,labels=c("Empir.","Homog.","Heter.","Covar.")), Type=factor(Type, levels=1:2,labels=c("Global","Local")))
+    c.nms <- colnames(dat)
+    colnames(dat)[c.nms=="Time"] <- xlab
+    if (!useGG) {
+      if (plot.it) {
+        plot(1:nTimePts,fitEntObj$HtMB0,type='n',ylim=ylim,ylab='H(t)',xlab=xlab,main=main,cex.main=cex.main,...)
+        lines(1:nTimePts,fitEntObj$HtMB0,lty=2,col=2)
+        lines(1:nTimePts,fitEntObj$HtCov,lty=2,col=4,lwd=1) 
+        lines(1:nTimePts,fitEntObj$cHtMB0,lty=1,col=2,lwd=2)
+        lines(1:nTimePts,fitEntObj$cHtCov,lty=1,col=4,lwd=1)
+        lines(1:nTimePts,HtEmpiric,col=1,lty=1) 
+        lines(1:nTimePts,fitEntObj$HtMB1,lty=2,col=3)
+        lines(1:nTimePts,fitEntObj$cHtMB1,lty=1,col=3,lwd=1)
+        legCol <- c(1,3,2,4,3,2,4)
+        legLty <- c(1,1,1,1,2,2,2)
+        legTxt <- c("Empirical","Global Homog.","Global Heter.","Global Covar.","Local Homog.","Local Heter.","Local Covar.")
+        if (!is.null(refLine)) {
+          lines(1:nTimePts,refLine,lty=3,col=8,lwd=2)
+          legCol <- c(8,legCol)
+          legLty <- c(3,legLty)
+          legTxt <- c(refLab,legTxt)
+        }
+        legend(leg.pos,col=legCol,lty=legLty,legend=legTxt,bty='n',cex=.4)
+      }
+      return(invisible(dat)) #could be useful for diagnostics
+    } else { #use dat ds
+      gg<-ggplot(data=dat,aes(x=!!sym(xlab),y=Entropy,group=interaction(Model,Type),colour=Model,linetype=Type))+geom_line(size=linesize)+scale_color_manual(values=c("Empir."="white","Homog."="green","Heter."="red","Covar."="blue"))+geom_line(data=dat[dat$Model=="Empir.",],aes(x=!!sym(xlab),y=Entropy),colour="white",size=linesize/2.4)+guides(linetype=guide_legend(override.aes=list(color=c("black","black"))))
+      if (!is.null(tick.interval)) gg <- gg+scale_x_continuous(breaks=seq(0, nTimePts, by=tick.interval))
+      return(gg)
+    }
+}
+
+plotAcc <- function(fitEntObj,seqData,weight=NULL,xlab="Occasion", tick.interval=NULL, main="",leg.pos="bottomright", useGG=F, linesize=1) {
+  
+  acc1.mb0 <- acc1(fitEntObj$fitMB0,seqData) 
+  acc1.mb1 <- acc1(fitEntObj$fitMB1,seqData)
+  acc1.cov <- acc1(fitEntObj$fitCov,seqData)
+
+  acc2.mb0 <-avgEnt(fitEntObj$fitMB0,weight=weight)$acc
+  acc2.mb1 <-avgEnt(fitEntObj$fitMB1,weight=weight)$acc
+  acc2.cov <-avgEnt(fitEntObj$fitCov,weight=weight)$acc
+  #nTimePts from seqdata object
+  nTimePts <- ncol(seqData)
+  #build dataset
+  dat <- data.frame(Time=1:nTimePts,Model=1,Type=1,Accuracy=acc1.mb1) %>%
+         add_row(Time=1:nTimePts,Model=2,Type=1,Accuracy=acc1.mb0) %>%  
+         add_row(Time=1:nTimePts,Model=3,Type=1,Accuracy=acc1.cov) %>%  
+         add_row(Time=1:nTimePts,Model=1,Type=2,Accuracy=acc2.mb1) %>%  
+         add_row(Time=1:nTimePts,Model=2,Type=2,Accuracy=acc2.mb0) %>%  
+         add_row(Time=1:nTimePts,Model=3,Type=2,Accuracy=acc2.cov) 
+  dat <- dat %>% mutate(Model=factor(Model,levels=1:3,labels=c("Homog.","Heter.","Covar.")), Type=factor(Type,levels=1:2, labels=c("Global","Local")))
+  c.nms <- colnames(dat)
+  colnames(dat)[c.nms=="Time"] <- xlab
+  #conditional Accuracy.
+  if (!useGG) {
+    plot(1:nTimePts,acc2.mb0,type='n',ylim=c(0,1),ylab='Conditional Accuracy',xlab=xlab, main=main)
+    lines(1:nTimePts,acc1.mb0, lwd=1, col=2)
+    lines(1:nTimePts,acc1.mb1, lwd=1, col=3)
+    lines(1:nTimePts,acc1.cov, lwd=1, col=4)
+    lines(1:nTimePts,acc2.mb0, lty=2, lwd=2, col=2)
+    lines(1:nTimePts,acc2.mb1, lty=2, lwd=2, col=3)
+    lines(1:nTimePts,acc2.cov, lty=2, lwd=2, col=4)
+    legend(leg.pos,col=rep(c(3,2,4),times=2), lty=c(1,1,1,2,2,2),legend=c("Global Homog.","Global Heter.","Global Covar.","Local Homog.","Local Heter.","Local Covar."), bty='n',cex=.5)
+    #text(nTimePts,acc1.cov[nTimePts]-.01,"Eq (3)",cex=.5)
+    #text(nTimePts,acc2.cov[nTimePts]+.01,"Eq (4)",cex=.5)
+  } else {
+    gg<-ggplot(data=dat,aes(x=!!sym(xlab),y=Accuracy,group=interaction(Model,Type),colour=Model,linetype=Type))+geom_line(size=linesize)+scale_color_manual(values=c("Homog."="green","Heter."="red","Covar."="blue"))
+    if (!is.null(tick.interval)) gg <- gg+scale_x_continuous(breaks=seq(0, nTimePts, by=tick.interval))
+    return(gg)
+  }
+  invisible(dat)
+}
+
+pvals <- function(fit,fit2=NULL,skipBe=FALSE) { #allows for a second fit & comparisons between them
+  #two-sided normal distn (not t) p-vals
+  if (is.null(fit2)) {
+    if (!skipBe) p.Be <- 2*pnorm(abs(fit$Be/fit$seBe),lower.tail=F) else p.Be <- NA 
+    p.Ga <- 2*pnorm(abs(fit$Ga/fit$seGa),lower.tail=F)
+  } else {
+    if (!skipBe) p.Be <- 2*pnorm(abs(fit$Be-fit2$Be)/sqrt(fit$seBe^2+fit2$seBe^2),lower.tail=F) else p.Be <- NA
+    p.Ga <- 2*pnorm(abs(fit$Ga-fit2$Ga)/sqrt(fit$seGa^2+fit2$seGa^2),lower.tail=F)
+  }
+  list(pBe=p.Be, pGa=p.Ga)
+}
+
+pR2ent <- function(Ht0,Ht1,mean=T,cont.corr=0.0001) {
+  #computes change in entropy (Ht) from "0" to "1" 
+  #mean: take mean first
+  if (mean) {
+    r <- (mean(Ht0)-mean(Ht1))/mean(Ht0) #assume mean is never 0
+  } else r <- (Ht0-Ht1)/ifelse(Ht0!=0,Ht0,Ht0+cont.corr)
+  r
+}
+
+diagByCov <- function(Ga,Xmat) {
+  #compute diagonal of PI using Xmat values 
+  M <- dim(Ga)[3]
+  n <- nrow(Xmat)
+  r <- matrix(NA,n,M)
+  for (i in 1:n) {
+    PI <-invMlogitLM(Ga,Xmat[i,]) 
+    r[i,] <- diag(PI)
+  }
+  r
+}
+
+  
+```
+
+```{r recover-MC0, include=TRUE, echo=FALSE, message=F, results='hide',fig.dim=c(6,3),  warning=FALSE, fig.cap="\\label{fig:Ht-sim}Simulated Data: model-based entropy over time evaluated globally (solid lines) and locally (dashed lines) for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. Cross-sectional Shannon entropy is shown as a white solid line."}
+#minor data tweaking:
+randoLong0 <- as.data.frame(randoLong)
+randoLong0$state <- as.numeric(randoLong0$state)-1 #lmestMc requires initial state coded as 0, not 1.
+xx.sim<-fitEnt(state ~ x1+x2,data=randoLong0,se=T)
+#side calc
+avgXmat <- apply(xx.sim$fitCov$PI[,,,-1],c(1,2),mean) #excludes last time
+#apply(apply(xx.sim$fitCov$PI[,,,-1],c(1,2,4),mean),3,diag)
+pseudoR2 <- pR2ent(xx.sim$cHtCov,xx.sim$HtCov,mean=T)
+suppressMessages(plotEnt(xx.sim,seqData=seq_rando,useGG=T))
+```
+
+```{r acc-0, include=TRUE, echo=FALSE, fig.dim=c(6,3),  warning=FALSE, fig.cap="\\label{fig:acc-sim}Simulated Data: global (solid lines) and local (dashed) accuracy over time for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities."}
+plotAcc(xx.sim,seq_rando,leg.pos="bottomright",useGG=T)
+```
+
+```{r mvad-0-a, echo=FALSE, mysize=T, warning=F, message=F, results='hide',size="\\tiny", include=FALSE}
+data(mvad)
+mvad.labels <- c("employment", "further education", "higher education", "joblessness", "school", "training")
+mvad.scodes <- c("EM","FE","HE","JL","SC","TR")
+reorder0 <- c(5,2,3,6,1,4)
+seq_mvad <- seqdef(mvad, 15:86, alphabet=c("school","FE","HE","training","employment","joblessness"), states=mvad.scodes[reorder0], weight=mvad$weight, labels=mvad.scodes[reorder0])
+#change for consistency
+colnames(seq_mvad) <- 1:72
+seq_mvad_orig <- seqdef(mvad, 15:86, states=mvad.scodes, weight=mvad$weight, labels=mvad.scodes) #need non-re-ordered version sometimes.
+```
+
+```{r mvad-0-b, echo=FALSE,  warning=F, message=F, results='hide', mysize=T, fig.dim=c(8,4),  size="\\tiny",fig.cap="\\label{fig:seqplots-mvad}MVAD: state distribution plots (left panel) and index plots (right panel). The x-axis represents months after secondary education becomes non-compulsory (age 16). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school)."}
+gg1<-ggseqdplot(seq_mvad) + theme(legend.position="bottom")+theme(axis.text.x=element_text(size=7),legend.text=element_text(size=7),axis.title.x=element_text(size=8))+xlab("Month")+guides(fill=guide_legend(nrow=1,ncol=6,reverse = TRUE))+scale_x_discrete(breaks = as.character(c(1,seq(6, 72, by = 6))))
+gg2<-ggseqiplot(seq_mvad,sortv=sortv(seq_mvad,start="beg")) + theme(legend.position="bottom")+theme(axis.text.x=element_text(size=7), legend.position="none",axis.title.x=element_text(size=8))+xlab("Month")+scale_x_discrete(breaks = as.character(c(1,seq(6, 72, by = 6))))
+invisible_grob <- grid::rectGrob(name="invisible_grob",width=unit(0,"null"),height=unit(0, "null"))
+gridExtra::grid.arrange(gg1,arrangeGrob(invisible_grob,gg2,invisible_grob,
+                         heights=c(0.00,0.93,.07)),ncol=2)
+```
+
+```{r mvad-0-c, echo=FALSE,  warning=F, mysize=T, include=FALSE}
+M <- 72 #number of months
+
+#data organization
+mvad_wide <- mvad[,c(1,15:(15+M-1))] #demographics in columns 2:15
+colnames(mvad_wide) <- c("id", as.character(1:M))
+mvad_long <- gather(mvad_wide, key=time, value=state, "1":as.character(M))
+mvad_long$time <- as.numeric(mvad_long$time)
+mvad_long <- mvad_long %>% mutate(state=as.factor(state)) %>% arrange(id,time)
+mvad_long <- mvad_long %>% mutate(yl=lag(state))
+mvad_long$yl[is.na(mvad_long$yl)] <- "school" #becomes 0... hopefully ignored
+mvad_long$male <- rep(mvad$male=="yes",each=M)
+mvad_long$fmpr <- rep(mvad$fmpr=="yes",each=M)
+mvad_long$weight <- rep(mvad$weight,each=M)
+mvad_long$month <- mvad_long$time
+mvad_long$timeFactor <- factor(mvad_long$time,levels=1:M)
+mvad_long <- mvad_long %>% arrange(id,time) %>% group_by(id) %>% mutate(emp=cumsum(state=="employment"), tra= cumsum(state=="training"), sch=cumsum(state=="school"), HE= cumsum(state=="HE"), jl=cumsum(state=="joblessness"), FE= cumsum(state=="FE")) %>% ungroup() 
+#interactions:
+mvad_long$male.month <- mvad_long$male*mvad_long$month
+mvad_long$male.emp <- mvad_long$male*mvad_long$emp
+mvad_long$male.sch <- mvad_long$male*mvad_long$sch
+``` 
+
+```{r bic-mvad-1, echo=F, warning=F}
+#minor data tweaking:
+mvad_long0 <- as.data.frame(mvad_long) %>% mutate(state=as.numeric(state)-1)
+###
+xx.mvad<-fitEnt(state ~ male+fmpr|month+emp+sch,data=mvad_long0,weight=mvad$weight,state.codes=mvad.scodes)
+pseudoR2 <- pR2ent(xx.mvad$cHtCov,xx.mvad$HtCov,mean=T)
+bic.mb1 <- prettyNum(xx.mvad$fitMB1$bic,big.mark=",")
+bic.mb0 <- prettyNum(xx.mvad$fitMB0$bic,big.mark=",")
+bic.cov <- prettyNum(xx.mvad$fitCov$bic,big.mark=",")
+```
+
+```{r recover-MVAD, include=TRUE, echo=FALSE, warning=FALSE,  fig.dim=c(6,3), mysize=T, size="\\tiny", fig.cap="\\label{fig:Ht-mvad}MVAD: model-based entropy over time evaluated globally (solid lines) and locally (dashed lines) for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. Cross-sectional entropy is depicted as a white solid line. The x-axis represents months after secondary education becomes non-compulsory (age 16)."}
+
+plotEnt(xx.mvad, seqData=seq_mvad, xlab="Month", tick.interval=12, useGG=T)
+```
+
+```{r transMat-mvad-prep, echo=F, warning=F, include=F}
+sch.mns <- cumsum(apply(seq_mvad=="SC",2,wtd.mean,weight=mvad$weight))
+emp.mns <- cumsum(apply(seq_mvad=="EM",2,wtd.mean,weight=mvad$weight))
+month.mns <- 1:72 #months
+pvs<- pvals(xx.mvad$fitCov) 
+sig.covs <- pvs$pBe[-1,]<.05
+sig.male <- mvad.scodes[-1][sig.covs[1,]]
+sig.fmpr <- mvad.scodes[-1][sig.covs[2,]]
+```
+
+```{r transMat-mvad-1, echo=F, warning=F, fig.dim=c(6,3),  fig.cap="\\label{fig:mvad-auto}MVAD: state persistence over time for MC model with covariates. Line thickness captures the relative proportion of individuals in that state at that time. The x-axis represents months after secondary education becomes non-compulsory (age 16). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school)."}
+sch.mns <- cumsum(apply(seq_mvad=="SC",2,wtd.mean,weight=mvad$weight))
+emp.mns <- cumsum(apply(seq_mvad=="EM",2,wtd.mean,weight=mvad$weight))
+month.mns <- 1:72 #months
+lwds <- reshape2::melt(t(seqstatd(seq_mvad,weighted=T)$Frequencies))
+pts <- diagByCov(xx.mvad$fitCov$Ga,cbind(1,month.mns,emp.mns,sch.mns))
+dat <- reshape2::melt(pts[,reorder0])
+names(dat) <- c("Month","State","Probability")
+#dat$State <- factor(dat$State,levels=reorder0,labels=mvad.scodes[reorder0]) #reorders strangely
+dat$State <- factor(dat$State,levels=1:6,labels=mvad.scodes[reorder0])
+dat$lwd <- lwds$value
+ggplot(data=dat,aes(x=Month,y=Probability,group=State,colour=State,size=lwd))+geom_line()+scale_color_manual(values=cpal(seq_mvad))+guides(size="none")+scale_x_continuous(breaks=seq(0,72,by=12))
+```
+
+```{r clustering-om-a, include=FALSE, echo=FALSE, warning=FALSE}
+dist.lcs <- seqdist(seq_mvad, method="LCS")
+set.seed(10101)
+clusts.lcs <- agnes(dist.lcs, diss=TRUE, method="ward")
+cl.2 <- cutree(clusts.lcs, k=2)
+cl.3 <- cutree(clusts.lcs, k=3)
+cl.4 <- cutree(clusts.lcs, k=4)
+cl.5 <- cutree(clusts.lcs, k=5)
+cl.6 <- cutree(clusts.lcs, k=6)
+```
+
+
+```{r clustering-om-c, echo=FALSE, warning=FALSE, fig.dim=c(8,4),  size="\\tiny", fig.cap="\\label{fig:mvad-clusts}MVAD: state distribution plots for three-cluster solution. The x-axis represents months after secondary education becomes non-compulsory (age 16). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school)."}
+gg<-ggseqdplot(seq_mvad,group=paste0("Cluster ",cl.3,"\n"))+guides(fill=guide_legend(label.position="right",nrow=1,reverse=T))+theme(axis.text.x=element_text(size=7))+scale_x_discrete(breaks = c(1,seq(6, 72, by = 6)))
+gg
+```
+
+```{r MVAD-x-cl3,echo=FALSE,  warning=F, fig.dim=c(6,3),  fig.cap="\\label{fig:ent-mvad3}MVAD: model-based entropy over time evaluated globally (solid lines) and locally (dashed lines) among three clusters for different MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. Grey dotted line represents the population-level common, empirical cross-sectional Shannon entropy. Cluster-specific cross-sectional entropy is depicted as a white solid line. The x-axis represents months after secondary education becomes non-compulsory (age 16)."}
+#split by 3-clusts
+nClusts <- 3
+clusterings <- list(NULL,cl.2,cl.3,cl.4,cl.5,cl.6)
+cl.long <- rep(clusterings[[nClusts]],each=72) #assumes id's ordered in mvad_long0
+xx.mvad.cl <- vector("list",length=nClusts)
+for (j in 1:nClusts) { #loop through cl... values
+  subset0 <- j== clusterings[[nClusts]]
+  xx.mvad.cl[[j]] <- fitEnt(state ~ fmpr|month+emp+sch, mvad_long0, subset.long=(cl.long==j), subset.wide=subset0, weight=mvad$weight, state.codes=mvad.scodes)
+  if (j==1) {
+    dat <- plotEnt(xx.mvad.cl[[j]], seqData=seq_mvad[subset0 ,], xlab="Month", plot.it=F) %>% mutate(Subgroup=j)
+  } else {
+    dat <- dat%>% add_row(plotEnt(xx.mvad.cl[[j]], seqData=seq_mvad[subset0 ,], xlab="Month",  plot.it=F) %>% mutate(Subgroup=j))
+  }
+}
+dat <- dat %>% mutate(Subgroup=factor(Subgroup,levels=1:3,labels=paste0("Cluster ",1:3)))
+linesize=1.1
+gg<-ggplot(data=dat,aes(x=Month,y=Entropy,group=interaction(Model,Type),colour=Model,linetype=Type))+geom_line(size=linesize)+scale_color_manual(values=c("Empir."="white","Homog."="green","Heter."="red","Covar."="blue"))+geom_line(data=dat[dat$Model=="Empir.",],aes(x=Month,y=Entropy),colour="white",size=linesize/2.3)+facet_wrap(~Subgroup, nrow=1)+geom_line(data=dat[dat$Model=="Empir.",]%>%mutate(Entropy=rep(xx.mvad$cHtMB0,times=nClusts)),aes(x=Month,y=Entropy),linetype="dotted",color="darkgrey",size=1.0)+guides(linetype=guide_legend(override.aes=list(color=c("black","black"))))+scale_x_continuous(breaks=seq(0,72,by=12))
+gg
+```
+
+```{r,  include=FALSE, echo=FALSE, warning=FALSE}
+aggHavg <- mean(xx.mvad$cHtCov)
+disAgg3Havg <- sapply(lapply(xx.mvad.cl, "[[", "cHtCov"),mean)
+```
+
+```{r estimates-all-mvad-cl-DDx,  warning=F, echo=F,  fig.height=4, warning=FALSE,fig.cap="\\label{fig:mvad-dd-clust-month}MVAD: Covariate effect for time (month) presented as odds ratios for the transition probabilities relative to staying in the same state for two clusters (panels 1 and 2) and the estimated relative odds ratio comparing cluster 2 to 1 (panel 3). The intensity of cell color indicates the relative magnitude of the estimated coefficient (within matrix). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school). An X represents a n.s. coefficient."} 
+#setup for pairwise differences 
+idxs <- t(combn(1:nClusts,2))
+pairNms <- apply(idxs,1,paste,collapse="-")
+orLim <- Inf
+i <- 1 #choice for comparison
+j <- 1 # 'month'
+#cols <- colorRampPalette(c("red2","lightsalmon2","lightsalmon","lightblue",rep(c("deepskyblue","blue","blue2","blue3","blue4"),each=3)))(21)
+cols <- rev(colorspace::diverge_hsv(21)) #reds and blues
+ttl <- c("MVAD: odds ratios for transitions") 
+par(mfrow=c(1,3))
+pvPair.arr <- pvals(xx.mvad.cl[[idxs[i,1]]]$fitCov)$pGa
+pvPair1 <- movRef(pvPair.arr[1+j,,])[reorder0,reorder0] #skip intercept
+pvPair.arr <- pvals(xx.mvad.cl[[idxs[i,2]]]$fitCov)$pGa
+pvPair2 <- movRef(pvPair.arr[1+j,,])[reorder0,reorder0] #skip intercept
+pvPair.arr <- pvals(xx.mvad.cl[[idxs[i,1]]]$fitCov,xx.mvad.cl[[idxs[i,2]]]$fitCov)$pGa
+pvPair21 <- movRef(pvPair.arr[1+j,,])[reorder0,reorder0] #skip intercept
+
+orMat <- movRef(exp(xx.mvad.cl[[idxs[i,1]]]$fitCov$Ga[1+j,,]))
+diag(orMat) <- 1 #hack to center colors
+orMat <- orMat[reorder0,reorder0]
+orMat1 <- orMat
+corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),"Cluster ",idxs[i,1]), is.corr=F, method='color',addCoef.col='grey50', col.lim=c(min(orMat),2-min(orMat)), cl.pos='b', cl.length=7,p.mat= pvPair1,col=cols,diag=F)
+orMat <- movRef(exp(xx.mvad.cl[[idxs[i,2]]]$fitCov$Ga[1+j,,]))
+diag(orMat) <- 1 #hack to center colors
+orMat <- orMat[reorder0,reorder0]
+orMat2 <- orMat
+corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),"Cluster ",idxs[i,2]), is.corr=F, method='color',addCoef.col='grey50',  col.lim=c(min(orMat),max(max(orMat),2-min(orMat))), cl.pos='b', cl.length=7,p.mat= pvPair2,col=cols,diag=F)
+orMat <- orMat2/orMat1
+limits <- c(min(orMat),2-min(orMat))
+if (max(orMat)>limits[2]) limits <- c(2-max(orMat),max(orMat)) #awkward, but centers on 1.
+corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),"Clusters ",paste0(rev(idxs[i,]),collapse=" vs. ")), is.corr=F, method='color',addCoef.col='grey50',  col.lim=limits, cl.pos='b', cl.length=7,p.mat= pvPair21,col=cols,diag=F)
+#title(main=paste0(ttl,'\n',"Age effects for a cluster pair"),outer=T,line=-2.5)
+cat("\n\n\n\n")
+```
+
+\appendix
+\setcounter{figure}{0} <!-- Resets the figure counter to zero. -->
+\renewcommand{\thefigure}{A\arabic{figure}}
+
+```{r indiv-entropy-sim,  warning=F, fig.dim=c(8,4),  echo=F,fig.cap="\\label{fig:indiv-entropy-sim}Simulated Data: Subsample index plot (left panel) sorted by sequence entropy (lowest at bottom). Density of entropy applied to individual sequences (right panel, rotated to refer to left panel), full population (black, solid) and left panel sample (light blue, dashed)."}
+set.seed(10101)
+M <- 25
+startVal <- seq_rando[,1]
+samp <- NULL #initialize
+for (i in 1:3) {
+  idxs <- (1:nrow(seq_rando))[startVal==i]
+  samp <- c(samp,sample(idxs,M,replace=F))
+}
+dat2 <- rbind(data.frame(Entropy=ent.obs,group="Population"),data.frame(Entropy=ent.obs[samp],group="Sample"))
+gg2<-ggplot(data=dat2,aes(x=Entropy,color=group,linetype=group))+ stat_density(alpha=0.5,geom='line', position = "identity")+ scale_color_manual(values = c("Population" = "black", "Sample" = "blue")) + scale_linetype_manual(values = c("Population" = "solid", "Sample" = "dashed")) + xlab("Entropy of Sequence (rescaled)")+theme(axis.title.x=element_text(size=8)) + theme(legend.title = element_blank(), legend.text = element_text(size = 6), legend.key.size = unit(0.5, "cm"), legend.position = "bottom") + 
+guides(color = guide_legend(override.aes = list(fill = c("black", "blue")))) +coord_flip()
+#add: rep(1:3,each=M)*100 to ent.obs to get sort by first obs first
+gg1<-ggseqiplot(seq_rando[samp,],sortv=ent.obs[samp])+theme(legend.text=element_text(size=7),axis.title.x=element_text(size=8))+xlab("Month")
+invisible_grob <- grid::rectGrob(name="invisible_grob",width=unit(0,"null"),height=unit(0, "null"))
+gridExtra::grid.arrange(gg1,arrangeGrob(invisible_grob,gg2,invisible_grob,
+                         heights=c(0.03,0.95,.02)),ncol=2)
+```
+
+
+```{r estimates-all-working-0-new,  warning=F, fig.height=3,   echo=F,fig.cap="\\label{fig:simCovEffs}Simulated Data: Covariate effects ($x_1$, $x_2$) presented as odds ratios for the transition probabilities from one of the three states (A, B, C) of the MC model to another state, relative to staying in the same state."}
+ttl <- c("Simulated data: odds ratios for transitions") 
+cov.nms <- c("x1","x2")
+state.nms <- c("A","B","C") 
+cols <- rev(colorspace::diverge_hsv(21))[12:21] #reds and blues -- take blues
+cols <- rev(colorspace::diverge_hsv(27))[15:24] #reds and blues -- take blues -- less contrast
+dimnames(xx.sim$fitCov$Ga)[[3]] <- state.nms #used by inverse function code
+pv.arr <- pvals(xx.sim$fitCov)$pGa
+par(mfrow=c(1,2))
+for (j in 1:2) {
+  orMat <- movRef(exp(xx.sim$fitCov$Ga[1+j,,]))
+  diag(orMat) <- 1 # to avoid 0s there.
+  pv <- movRef(pv.arr[1+j,,])
+  dimnames(pv) <- list( state.nms, state.nms)
+  corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",2),sep="",collapse=""),cov.nms[j]), is.corr=F, addCoefasPercent=F, diag=F, method='color',col=cols,mar=c(0,0,4,0),addCoef.col='grey50',col.lim=c(1,3.5), cl.pos='b', cl.length=7,p.mat=pv,cl.cex=.7)
+}
+# title(ttl,outer=T,line=-2)
+```
+
+```{r acc-mvad-0, include=TRUE, echo=FALSE, warning=FALSE, fig.height=3.5,  fig.cap="\\label{fig:acc-mvad}MVAD: accuracy over time evaluated globally (solid lines) and locally (dashed lines) for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. The x-axis represents months after secondary education becomes non-compulsory (age 16)."}
+plotAcc(xx.mvad,seq_mvad_orig,leg.pos="bottomright", xlab="Month", tick.interval=12, weight=mvad$weight,useGG=T)
+```
+
+```{r estimates-all-mvad-0-b-new, echo=F, warning=F, fig.height=4,  fig.cap="\\label{fig:mvad-orMat}MVAD: covariate effects for months, cumulative employment, and cumulative schooling presented as odds ratios for the transition probabilities from one of the six states of the MC model to another state, relative to staying in the same state. The intensity of cell color indicates the relative magnitude of the estimated coefficient (within matrix). Abbreviations: SC = School; FE = Further (vocational) education; HE = Higher education; TR = Apprenticeship training; EM = employment; JL = jobless (not in school). An X represents a n.s. coefficient."}
+ttl <- c("MVAD: odds ratios for transitions") 
+#
+pv.arr <- pvals(xx.mvad$fitCov)$pGa
+mvad.cov.nms <- dimnames(pv.arr)[[1]][-1] #drop intercept.
+orMatList0 <- vector("list",length=3)
+cols <- rev(colorspace::diverge_hsv(21)) #reds and blues
+par(mfrow=c(1,3))
+for (j in 1:3) {
+  orMat <- movRef(exp(xx.mvad$fitCov$Ga[1+j,,]))
+  diag(orMat) <- 1 #hack to center colors
+  orMat <- orMat[reorder0,reorder0]
+  orMatList0[[j]] <- orMat
+  pv <- movRef(pv.arr[1+j,,])[reorder0,reorder0] 
+  limits <- c(min(orMat),2-min(orMat))
+  if (max(orMat)>limits[2]) limits <- c(2-max(orMat),max(orMat)) #awkward, but centers on 1.
+  dimnames(pv) <- list( mvad.scodes, mvad.scodes)
+  corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),mvad.cov.nms[j]), is.corr=F, method='color',addCoef.col='grey50', col.lim=limits,cl.pos='b', cl.length=7,p.mat=pv, col=cols, diag=F)
+}
+```
+
+```{r MVAD-x-sex,echo=FALSE,  warning=F, fig.dim=c(6,3),  fig.cap=c("\\label{fig:ent-mvad-sex}MVAD: model-based entropy over time evaluated globally (solid lines) and locally (dashed lines) among females (left panel) and males (right panel) for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. Aggregated model-based entropy for the whole sample in grey dots. Cross-sectional entropy is depicted as a white solid line. The x-axis represents months after secondary education becomes non-compulsory (age 16).")}
+#split by sex
+xx.mvad.male <- vector("list",length=2)
+for (j in 1:2) { #loop through fmpr
+  subset0 <- mvad$male==c("no","yes")[j]
+  xx.mvad.male[[j]] <- fitEnt(state ~ fmpr|month+emp+sch, mvad_long0, subset.long=(mvad_long0$male==j-1), subset.wide=subset0, weight=mvad$weight, state.codes=mvad.scodes)
+  if (j==1) {
+    dat <- plotEnt(xx.mvad.male[[j]], seqData=seq_mvad[subset0 ,], xlab="Month", plot.it=F) %>% mutate(Subgroup=j)
+  } else {
+    dat <- dat%>% add_row(plotEnt(xx.mvad.male[[j]], seqData=seq_mvad[subset0 ,], xlab="Month", plot.it=F) %>% mutate(Subgroup=j))
+  }
+}
+dat <- dat %>% mutate(Subgroup=factor(Subgroup,levels=1:2,labels=c("Female","Male")))
+linesize=1.1
+gg<-ggplot(data=dat,aes(x=Month,y=Entropy,group=interaction(Model,Type),colour=Model,linetype=Type))+geom_line(size=linesize)+scale_color_manual(values=c("Empir."="white","Homog."="green","Heter."="red","Covar."="blue"))+geom_line(data=dat[dat$Model=="Empir.",],aes(x=Month,y=Entropy),colour="white",size=linesize/2.3)+facet_wrap(~Subgroup, nrow=1)+geom_line(data=dat[dat$Model=="Empir.",]%>%mutate(Entropy=rep(xx.mvad$cHtMB0,times=2)),aes(x=Month,y=Entropy),linetype="dotted",color="darkgrey",size=1.0)+guides(linetype=guide_legend(override.aes=list(color=c("black","black"))))+scale_x_continuous(breaks=seq(0,72,by=12))
+gg
+```
+
+```{r,  include=FALSE, echo=FALSE, warning=FALSE}
+aggHavg <- mean(xx.mvad$cHtCov)
+disAggMaleHavg <- sapply(lapply(xx.mvad.male, "[[", "cHtCov"),mean)
+```
+
+
+```{r acc-mvad-2, include=TRUE, echo=FALSE, fig.dim=c(6,3),  warning=FALSE,fig.cap="\\label{fig:acc-mvad-sex}MVAD: accuracy over time evaluated globally (solid lines) and locally (dashed lines) among females (left panel) and males (right panel) for three MC models: time-homogeneous, time-heterogeneous, and with individual covariates for initial and transition probabilities. The x-axis represents months after secondary education becomes non-compulsory (age 16)."}
+gg <- vector("list",2)
+for (j in 1:2) {
+  subset0 <- mvad$male==c("no","yes")[j]
+  gg[[j]] <- plotAcc(xx.mvad.male[[j]],seq_mvad_orig[subset0,], xlab="Month", tick.interval=12, weight=mvad$weight[subset0], main=paste0("MVAD: ",c("female","male")[j]),leg.pos="bottomright",useGG=T)
+}
+# Side-by-side
+grid.arrange(gg[[1]]+theme(legend.position="bottom")+ggtitle("Females")+guides(color="none"),gg[[2]]+theme(legend.position="bottom")+ggtitle("Males")+guides(linetype="none"),  ncol=2)
+```
+
+```{r transMat-mvad-sex, echo=F, warning=F, fig.dim=c(6,3), fig.cap="\\label{fig:autocorr-mvad}MVAD: state persistence over time with covariates for a hypothetical average individual among females (left panel) and males (right panel). The thickness of the lines captures the relative proportion of individuals in that state at that time. The x-axis represents months after secondary education becomes non-compulsory (age 16). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school). "}
+#set up data for ggplot
+for (i in 1:2) { #sex-specific analysis
+  subset0 <- mvad$male==c("no","yes")[i]
+  sch.mns <- cumsum(apply(seq_mvad[subset0,]=="SC",2,wtd.mean,weight=mvad$weight[subset0]))
+  emp.mns <- cumsum(apply(seq_mvad[subset0,]=="EM",2,wtd.mean,weight=mvad$weight[subset0]))
+  lwds <- reshape2::melt(t(seqstatd(seq_mvad[subset0,],weighted=T)$Frequencies))
+  pts <- diagByCov(xx.mvad.male[[i]]$fitCov$Ga,cbind(1,month.mns,emp.mns,sch.mns)) 
+  dat0 <- reshape2::melt(pts[,reorder0])
+  names(dat0) <- c("Month","State","Probability")
+  dat0 <- dat0 %>% mutate(lwd=lwds$value,sex=c("female","male")[i],State=factor(State,labels=mvad.scodes[reorder0]), EMP=rep(emp.mns,times=6), SCH=rep(sch.mns,times=6))
+  if (i==1) dat <- dat0 else dat<-dat%>%add_row(dat0)
+}
+ggplot(data=dat,aes(x=Month,y=Probability,group=State,colour=State,size=lwd))+geom_line()+scale_color_manual(values=cpal(seq_mvad))+facet_wrap(~sex, nrow=1)+guides(size="none")+scale_x_continuous(breaks=seq(0,72,by=12))
+emps <- tapply(dat$EMP,dat[,c("Month","sex")],mean)
+schs <- tapply(dat$SCH,dat[,c("Month","sex")],mean)
+```
+
+
+```{r estimates-all-mvad-2-new, warning=F, echo=F, fig.height=4,  fig.cap=c("\\label{fig:cov-effs-sex1}MVAD: covariate effects for females (month, emp, sch) presented as odds ratios for the transition probabilities from one of the six states of the MC model to another state, relative to staying in the same state. The intensity of cell color indicates the relative magnitude of the estimated coefficient (within matrix). Abbreviations: SC = School; FE = Further (vocational) education; HE = Higher education; TR = Apprenticeship training; EM = employment; JL = jobless (not in school). An X represents a n.s. coefficient.","\\label{fig:cov-effs-sex2}MVAD: covariate effects for males (month, emp, sch) presented as odds ratios for the transition probabilities from one of the six states of the MC model to another state, relative to staying in the same state. The intensity of cell color indicates the relative magnitude of the estimated coefficient (within matrix). Abbreviations: SC = School; FE = Further (vocational) education; HE = Higher education; TR = Apprenticeship training; EM = employment; JL = jobless (not in school). An X represents a n.s. coefficient.")}
+ttl <- c("MVAD: odds ratios for transitions") 
+ttls <- c("Female","Male")
+mvad.cov.nms <- dimnames(xx.mvad$fitCov$Ga)[[1]][-1]
+cols <- rev(colorspace::diverge_hsv(21)) #reds and blues
+orMatList <- vector("list",length=2)
+for (i in 1:2) {
+  pv.arr <- pvals(xx.mvad.male[[i]]$fitCov)$pGa
+  par(mfrow=c(1,3))
+  orMatList[[i]] <- vector("list",length=3)
+  for(j in 1:3) {
+    orMat <- movRef(exp(xx.mvad.male[[i]]$fitCov$Ga[1+j,,]))
+    diag(orMat) <- 1 #hack to center colors
+    orMat <- orMat[reorder0,reorder0]
+    orMatList[[i]][[j]] <- orMat 
+    pv <- movRef(pv.arr[1+j,,])[reorder0,reorder0]
+    dimnames(pv) <- list( mvad.scodes, mvad.scodes)
+    limits <- c(min(orMat),2-min(orMat))
+    if (max(orMat)>limits[2]) limits <- c(2-max(orMat),max(orMat)) #awkward, but centers on 1.
+    corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),mvad.cov.nms[j]), is.corr=F, method='color',addCoef.col='grey50', col.lim=limits,cl.pos='b', cl.length=7,p.mat=pv, col=cols, diag=F)
+  }
+  #title(main=paste0(ttl,'\n',ttls[i]),outer=T,line=-2.5)
+  cat("\n\n\n\n")
+}
+```
+
+```{r estimates-all-mvad-2-DD, include=TRUE, echo=FALSE,  fig.height=4, warning=FALSE,fig.cap="\\label{fig:rrr-mvad-sex}MVAD: covariate effects for males vs. females;  relative risk ratios for the transition probabilities from one of the six states of the MC model to another state, relative to staying in the same state. The intensity of cell color indicates the relative magnitude of the estimated coefficient (within matrix). Abbreviations: SC = School; FE = Further (vocational) education; HE = Higher education; TR = Apprenticeship training; EM = employment; JL = jobless (not in school). An X represents a n.s. coefficient."}
+pv01.arr <- pvals(xx.mvad.male[[2]]$fitCov,xx.mvad.male[[1]]$fitCov)$pGa
+cols <- rev(colorspace::diverge_hsv(21)) #reds and blues
+par(mfrow=c(1,3))
+for(j in 1:3) {
+  pv01 <- movRef(pv01.arr[1+j,,])[reorder0,reorder0] 
+  orMat <- orMatList[[2]][[j]] / orMatList[[1]][[j]] #already reordered?
+  limits <- c(min(orMat),2-min(orMat))
+  if (max(orMat)>limits[2]) limits <- c(2-max(orMat),max(orMat)) #awkward, but centers on 1.
+  corrplot::corrplot(orMat,title=paste0(paste0(rep("\n",7),sep="",collapse=""),mvad.cov.nms[j]), is.corr=F, method='color',addCoef.col='grey50', col.lim=limits,cl.pos='b', cl.length=7,p.mat=pv01, col=cols, diag=F)
+}
+#title(main=paste0("MVAD: Relative odds ratios (male/female)"),outer=T,line=-2.5)
+```
+
+```{r auto-mvad-clust, echo=F, warning=F, fig.height=3.5,  fig.cap="\\label{fig:auto-mvad-clust}MVAD: state persistence over time with covariates for a hypothetical average individual for three clusters solution. The thickness of the lines captures the relative proportion of individuals in that state at that time. The x-axis represents months after secondary education becomes non-compulsory (age 16). Abbreviations: SC=School; FE=Further (vocational) education; HE=Higher education; TR=Apprenticeship training; EM=employment; JL=jobless (not in school). "}
+
+#set up data for ggplot
+for (i in 1:nClusts) { #clust-specific analysis
+  subset0 <- i == clusterings[[nClusts]]
+  sch.mns <- cumsum(apply(seq_mvad[subset0,]=="SC",2,wtd.mean,weight=mvad$weight[subset0]))
+  emp.mns <- cumsum(apply(seq_mvad[subset0,]=="EM",2,wtd.mean,weight=mvad$weight[subset0]))
+  month.mns <- 1:72 #months
+  lwds <- reshape2::melt(t(seqstatd(seq_mvad[subset0,],weighted=T)$Frequencies))
+  pts <- diagByCov(xx.mvad.cl[[i]]$fitCov$Ga,cbind(1,month.mns,emp.mns,sch.mns))
+  dat0 <- reshape2::melt(pts[,reorder0])
+  names(dat0) <- c("Month","State","Probability")
+  dat0 <- dat0 %>% mutate(lwd=lwds$value,Cluster=i,State=factor(State,labels=mvad.scodes[reorder0]), EMP=rep(emp.mns,times=6), SCH=rep(sch.mns,times=6))
+  if (i==1) dat <- dat0 else dat<-dat%>%add_row(dat0)
+}
+dat <- dat%>%mutate(Cluster=factor(Cluster,labels=paste0("Cluster ",1:nClusts,sep="")))
+ggplot(data=dat,aes(x=Month,y=Probability,group=State,colour=State,size=lwd))+geom_line()+scale_color_manual(values=cpal(seq_mvad))+facet_wrap(~Cluster, nrow=1)+guides(size="none")+ scale_x_continuous(breaks=seq(0,72,by=12))
+emps <- tapply(dat$EMP,dat[,c("Month","Cluster")],mean)
+schs <- tapply(dat$SCH,dat[,c("Month","Cluster")],mean)
+```
+
+
+
+
